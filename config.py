@@ -11,7 +11,7 @@ import os
 # ----------------------------------------------------------------------------
 # Root of the extracted PTB-XL dataset (contains ptbxl_database.csv,
 # scp_statements.csv, records100/, records500/)
-DATA_DIR = os.environ.get("/lambda/nfs/Kiana2/ecgclip/data/ptbxl/ptbxl_database.csv", "./ptbxl")
+DATA_DIR = os.environ.get("DATA_DIR", "/lambda/nfs/Kiana2/ecgclip/data/ptbxl")
 
 # Where rendered ECG images and cached features/checkpoints go
 WORK_DIR = os.environ.get("WORK_DIR", "./work")
