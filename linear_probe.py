@@ -1,103 +1,197 @@
-"""
-Linear probe: train a small linear classifier on top of FROZEN BiomedCLIP
-image features. This is the cheapest way to "train on this dataset" and a
-standard way to measure how transferable a foundation model's features are.
+"""Train and evaluate a multi-label linear probe on frozen ECG embeddings."""
+from __future__ import annotations
 
-Prereq: run extract_features.py first.
-
-    python linear_probe.py
-
-Multi-label task (5 superclasses) -> BCEWithLogitsLoss, macro AUROC for model
-selection on the validation fold, final report on the test fold.
-"""
+import argparse
 import os
+import random
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score
 
 import config as C
+from evaluation import (
+    evaluate_multilabel,
+    print_metrics,
+    save_result,
+    tune_multilabel_thresholds,
+)
 
 
 def load_split(name):
-    X = np.load(os.path.join(C.FEAT_DIR, f"X_{name}.npy"))
-    y = np.load(os.path.join(C.FEAT_DIR, f"y_{name}.npy"))
-    return torch.from_numpy(X), torch.from_numpy(y)
+    features = np.load(os.path.join(C.FEAT_DIR, f"X_{name}.npy"))
+    labels = np.load(os.path.join(C.FEAT_DIR, f"y_{name}.npy"))
+    return torch.from_numpy(features), torch.from_numpy(labels)
 
 
-def macro_auroc(y_true, y_score):
-    aucs = []
-    for i in range(y_true.shape[1]):
-        col = y_true[:, i]
-        if 0 < col.sum() < len(col):
-            aucs.append(roc_auc_score(col, y_score[:, i]))
-    return float(np.mean(aucs)) if aucs else float("nan")
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main():
-    torch.manual_seed(C.SEED)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=C.SEED)
+    parser.add_argument(
+        "--threshold-mode",
+        choices=["per-class", "global", "fixed"],
+        default="per-class",
+    )
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--results-dir", default=os.path.join(C.WORK_DIR, "results"))
+    args = parser.parse_args()
+
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    Xtr, ytr = load_split("train")
-    Xva, yva = load_split("val")
-    Xte, yte = load_split("test")
-    dim, n_cls = Xtr.shape[1], ytr.shape[1]
-    print(f"feature dim {dim} | classes {n_cls} | "
-          f"train {len(Xtr)} val {len(Xva)} test {len(Xte)}")
+    train_features, train_labels = load_split("train")
+    val_features, val_labels = load_split("val")
+    test_features, test_labels = load_split("test")
+    feature_dim = train_features.shape[1]
+    n_classes = train_labels.shape[1]
+    print(
+        f"feature dim {feature_dim} | classes {n_classes} | "
+        f"train {len(train_features)} val {len(val_features)} "
+        f"test {len(test_features)} | seed {args.seed}"
+    )
 
-    # Standardise features (helps linear models converge).
-    mu, sd = Xtr.mean(0, keepdim=True), Xtr.std(0, keepdim=True) + 1e-6
-    Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
+    mean = train_features.mean(0, keepdim=True)
+    std = train_features.std(0, keepdim=True) + 1e-6
+    train_features = (train_features - mean) / std
+    val_features = (val_features - mean) / std
+    test_features = (test_features - mean) / std
 
-    clf = nn.Linear(dim, n_cls).to(device)
-    opt = torch.optim.AdamW(clf.parameters(), lr=C.LP_LR,
-                            weight_decay=C.LP_WEIGHT_DECAY)
-    # class imbalance -> positive weighting
-    pos = ytr.sum(0)
-    neg = len(ytr) - pos
-    pos_weight = (neg / pos.clamp(min=1)).to(device)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    classifier = nn.Linear(feature_dim, n_classes).to(device)
+    optimizer = torch.optim.AdamW(
+        classifier.parameters(),
+        lr=C.LP_LR,
+        weight_decay=C.LP_WEIGHT_DECAY,
+    )
 
-    Xtr, ytr = Xtr.to(device), ytr.to(device)
-    Xva_d, Xte_d = Xva.to(device), Xte.to(device)
+    positive = train_labels.sum(0)
+    negative = len(train_labels) - positive
+    positive_weight = (negative / positive.clamp(min=1)).to(device)
+    loss_function = nn.BCEWithLogitsLoss(pos_weight=positive_weight)
 
-    best_auc, best_state = -1.0, None
-    n = len(Xtr)
+    train_features = train_features.to(device)
+    train_labels_device = train_labels.to(device)
+    val_features_device = val_features.to(device)
+    test_features_device = test_features.to(device)
+
+    best_auroc = -float("inf")
+    best_state = None
+    generator = torch.Generator(device=device if device == "cuda" else "cpu")
+    generator.manual_seed(args.seed)
+
     for epoch in range(C.LP_EPOCHS):
-        clf.train()
-        perm = torch.randperm(n, device=device)
-        for i in range(0, n, C.BATCH_SIZE):
-            idx = perm[i:i + C.BATCH_SIZE]
-            opt.zero_grad()
-            loss = loss_fn(clf(Xtr[idx]), ytr[idx])
+        classifier.train()
+        permutation = torch.randperm(
+            len(train_features),
+            generator=generator,
+            device=device,
+        )
+        for start in range(0, len(train_features), C.BATCH_SIZE):
+            indices = permutation[start : start + C.BATCH_SIZE]
+            optimizer.zero_grad()
+            logits = classifier(train_features[indices])
+            loss = loss_function(logits, train_labels_device[indices])
             loss.backward()
-            opt.step()
+            optimizer.step()
 
-        clf.eval()
+        classifier.eval()
         with torch.no_grad():
-            va_score = torch.sigmoid(clf(Xva_d)).cpu().numpy()
-        auc = macro_auroc(yva.numpy(), va_score)
-        if auc > best_auc:
-            best_auc = auc
-            best_state = {k: v.detach().clone() for k, v in clf.state_dict().items()}
+            val_logits = classifier(val_features_device).cpu().numpy()
+            val_probabilities = torch.sigmoid(
+                torch.from_numpy(val_logits)
+            ).numpy()
+
+        validation_metrics = evaluate_multilabel(
+            val_logits,
+            val_labels.numpy(),
+            val_probabilities,
+            thresholds=args.threshold,
+            class_names=C.CLASSES,
+        )
+        validation_auroc = validation_metrics["macro_auroc"]
+        if np.isfinite(validation_auroc) and validation_auroc > best_auroc:
+            best_auroc = validation_auroc
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in classifier.state_dict().items()
+            }
+
         if epoch % 5 == 0 or epoch == C.LP_EPOCHS - 1:
-            print(f"epoch {epoch:3d}  val macro AUROC {auc:.4f}  (best {best_auc:.4f})")
+            print(
+                f"epoch {epoch:3d} val macro AUROC {validation_auroc:.4f} "
+                f"(best {best_auroc:.4f})"
+            )
 
-    clf.load_state_dict(best_state)
-    clf.eval()
+    if best_state is None:
+        raise RuntimeError("No valid validation AUROC was produced")
+
+    classifier.load_state_dict(best_state)
+    classifier.eval()
     with torch.no_grad():
-        te_score = torch.sigmoid(clf(Xte_d)).cpu().numpy()
-    yte_np = yte.numpy()
+        val_logits = classifier(val_features_device).cpu().numpy()
+        test_logits = classifier(test_features_device).cpu().numpy()
 
-    print("\n=== Linear probe on frozen BiomedCLIP features (test fold) ===")
-    print(f"macro AUROC : {macro_auroc(yte_np, te_score):.4f}")
-    for i, c in enumerate(C.CLASSES):
-        if 0 < yte_np[:, i].sum() < len(yte_np):
-            print(f"   {c:5s} AUROC: {roc_auc_score(yte_np[:, i], te_score[:, i]):.4f}")
+    val_probabilities = torch.sigmoid(torch.from_numpy(val_logits)).numpy()
+    test_probabilities = torch.sigmoid(torch.from_numpy(test_logits)).numpy()
+    thresholds = tune_multilabel_thresholds(
+        val_labels.numpy(),
+        val_probabilities,
+        mode=args.threshold_mode,
+        fixed_threshold=args.threshold,
+    )
+    metrics = evaluate_multilabel(
+        test_logits,
+        test_labels.numpy(),
+        test_probabilities,
+        thresholds=thresholds,
+        class_names=C.CLASSES,
+    )
 
-    torch.save(clf.state_dict(), os.path.join(C.CKPT_DIR, "linear_probe.pt"))
-    print(f"Saved linear head -> {os.path.join(C.CKPT_DIR, 'linear_probe.pt')}")
+    print("\n=== Linear probe on frozen BiomedCLIP features: test fold ===")
+    print_metrics(metrics, "multi")
+
+    checkpoint_path = Path(C.CKPT_DIR) / f"linear_probe_seed{args.seed}.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": best_state,
+            "feature_mean": mean,
+            "feature_std": std,
+            "classes": list(C.CLASSES),
+            "seed": args.seed,
+            "best_validation_macro_auroc": best_auroc,
+        },
+        checkpoint_path,
+    )
+    print(f"Saved linear head -> {checkpoint_path}")
+
+    result_path = Path(args.results_dir) / f"linear_probe_multi_seed{args.seed}.json"
+    save_result(
+        result_path,
+        metrics,
+        metadata={
+            "method": "linear_probe",
+            "task": "multi",
+            "shots": 0,
+            "seed": args.seed,
+            "checkpoint": str(checkpoint_path),
+            "classes": list(C.CLASSES),
+            "threshold_mode": args.threshold_mode,
+            "fixed_threshold": args.threshold,
+            "thresholds": thresholds.tolist(),
+            "validation_fold": C.VAL_FOLD,
+            "test_fold": C.TEST_FOLD,
+        },
+    )
+    print(f"Saved metrics -> {result_path}")
 
 
 if __name__ == "__main__":
